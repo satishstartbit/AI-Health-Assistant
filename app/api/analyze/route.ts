@@ -12,6 +12,8 @@ import {
   getConversationMessages,
   getRecentConversations,
   saveConversation,
+  findRelevantConversation,
+  type ConversationMessage,
   type ConversationRecord,
 } from "@/lib/mongodb";
 
@@ -151,7 +153,16 @@ function buildHistoryMessages(
   clientHistory: ChatHistoryItem[] | undefined,
   records: ConversationRecord[]
 ): BaseMessage[] {
-  const fromClient: BaseMessage[] = [];
+  const clientMessages = buildMessagesFromClient(clientHistory);
+  if (clientMessages.length > 0) {
+    return clientMessages;
+  }
+
+  return buildMessagesFromRecords(records);
+}
+
+function buildMessagesFromClient(clientHistory: ChatHistoryItem[] | undefined): BaseMessage[] {
+  const messages: BaseMessage[] = [];
 
   for (const message of clientHistory?.slice(-8) ?? []) {
     const content = message.content?.trim();
@@ -159,33 +170,79 @@ function buildHistoryMessages(
       continue;
     }
 
-    fromClient.push(
+    messages.push(
       message.role === "assistant"
         ? new AIMessage(content)
         : new HumanMessage(content)
     );
   }
 
-  if (fromClient.length > 0) {
-    return fromClient;
-  }
+  return messages;
+}
 
-  const fromRecords: BaseMessage[] = [];
+function buildMessagesFromRecords(records: ConversationRecord[]): BaseMessage[] {
+  const messages: BaseMessage[] = [];
 
   for (const record of records.slice().reverse()) {
-    const userText = record.userMessage || record.symptoms || "";
-    const assistantText = record.assistantMessage || record.summary || "";
+    const savedMessages = Array.isArray(record.messages) && record.messages.length > 0
+      ? record.messages
+      : [
+        {
+          role: "user",
+          content: record.userMessage || record.symptoms || "",
+        },
+        {
+          role: "assistant",
+          content: record.assistantMessage || record.summary || "",
+        },
+      ];
 
-    if (userText) {
-      fromRecords.push(new HumanMessage(userText));
-    }
+    for (const message of savedMessages) {
+      const content = message.content?.trim();
+      if (!content) continue;
 
-    if (assistantText) {
-      fromRecords.push(new AIMessage(assistantText));
+      messages.push(
+        message.role === "assistant"
+          ? new AIMessage(content)
+          : new HumanMessage(content)
+      );
     }
   }
 
-  return fromRecords;
+  return messages;
+}
+
+function normalizeChatHistory(chatHistory: ChatHistoryItem[] | undefined): ConversationMessage[] {
+  return (chatHistory ?? [])
+    .map((item) => {
+      const content = item.content?.trim();
+      if (!content) return null;
+
+      return {
+        role: item.role === "assistant" ? "assistant" : "user",
+        content,
+      } as ConversationMessage;
+    })
+    .filter((item): item is ConversationMessage => item !== null);
+}
+
+function buildSavedMessages(
+  chatHistory: ChatHistoryItem[] | undefined,
+  userMessage: string,
+  assistantMessage: string
+): ConversationMessage[] {
+  const messages = normalizeChatHistory(chatHistory);
+  const lastMessage = messages.at(-1);
+  const shouldAppendUser =
+    lastMessage?.role !== "user" || lastMessage?.content !== userMessage;
+
+  const savedMessages: ConversationMessage[] = [...messages];
+  if (shouldAppendUser) {
+    savedMessages.push({ role: "user", content: userMessage });
+  }
+  savedMessages.push({ role: "assistant", content: assistantMessage });
+
+  return savedMessages;
 }
 
 async function tavilyTool(query: string): Promise<TavilySearchResponse | null> {
@@ -276,11 +333,6 @@ async function streamCachedReply(
   }
 }
 
-// const model = new ChatGroq({
-//   model: process.env.OPENAI_MODEL ,
-//   temperature: 0.2,
-// });
-
 const model = new ChatGroq({
   apiKey: process.env.OPENAI_API_KEY!,
   model: process.env.OPENAI_MODEL ?? "llama-3.1-8b-instant",
@@ -290,12 +342,6 @@ const model = new ChatGroq({
 const riskAssessmentModel = model.withStructuredOutput(riskAssessmentSchema, {
   name: "health_risk_assessment",
 });
-
-// const classificationModel = new ChatOpenAI({
-//   model: process.env.OPENAI_MODEL ,
-//   temperature: 0,
-// }).withStructuredOutput(queryClassificationSchema, { name: "query_classification" });
-
 
 const classificationModel = new ChatGroq({
   apiKey: process.env.OPENAI_API_KEY!,
@@ -436,6 +482,7 @@ export async function POST(request: Request) {
   const currentMessage = (body.message ?? body.input ?? body.symptoms ?? "").trim();
   const userId = body.userId?.trim() || "anonymous";
 
+
   if (!currentMessage) {
     return Response.json({ error: "Message is required." }, { status: 400 });
   }
@@ -444,11 +491,22 @@ export async function POST(request: Request) {
     new ReadableStream<Uint8Array>({
       start(controller) {
         const send = (event: string, data: unknown) => {
-          controller.enqueue(createSseEvent(event, data));
+          try {
+            controller.enqueue(createSseEvent(event, data));
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.includes("Controller is already closed")
+            ) {
+              return;
+            }
+            throw error;
+          }
         };
 
         void (async () => {
           try {
+
             // ── Step 1: Classify the query ──────────────────────────────
             send("status", { stage: "classify", message: "Understanding your question..." });
 
@@ -517,9 +575,15 @@ export async function POST(request: Request) {
                 return;
               }
             }
+            console.log("Received message", { userId, currentMessage });
 
             // ── Step 4: Load recent history ─────────────────────────────
             const recentConversations = await getRecentConversations(userId, 8).catch(() => []);
+            const relatedRecentConversation = await findRelevantConversation(
+              currentMessage,
+              { userId, limit: 5 }
+            ).catch(() => null);
+            const includeRecentHistory = Boolean(relatedRecentConversation);
 
             // ── Step 4: Live search + LLM ───────────────────────────────
             let searchStatus = "Checking trusted medical sources...";
@@ -532,7 +596,16 @@ export async function POST(request: Request) {
             send("status", { stage: "search", message: searchStatus });
 
             const medicalContext = await medicalSearchTool(currentMessage, queryType === "urgent");
-            const historyMessages = buildHistoryMessages(body.chat_history, recentConversations);
+            let historyMessages: BaseMessage[] = [];
+
+            if (body.chat_history?.length) {
+              historyMessages = buildHistoryMessages(
+                body.chat_history,
+                includeRecentHistory ? recentConversations : []
+              );
+            } else if (includeRecentHistory) {
+              historyMessages = buildHistoryMessages(undefined, recentConversations);
+            }
 
             const forcedRisk: RiskLevel | undefined = queryType === "urgent" ? "High" : undefined;
             const riskLevel =
@@ -552,6 +625,7 @@ export async function POST(request: Request) {
               ...historyMessages,
               new HumanMessage(currentMessage),
             ];
+            console.log("Received message", { userId, currentMessage });
 
             send("status", { stage: "response", message: "Generating a fresh answer..." });
 
@@ -570,12 +644,14 @@ export async function POST(request: Request) {
               send("chunk", { text: `\n\n${DISCLAIMER}` });
             }
 
+            console.log("Generated reply", { userId, currentMessage, riskLevel, sourcesUsed: medicalContext.sources });
             const savedConversation = await saveConversation({
               userId,
               userMessage: currentMessage,
               assistantMessage: normalizedReply,
               riskLevel,
               sourcesUsed: medicalContext.sources,
+              messages: buildSavedMessages(body.chat_history, currentMessage, normalizedReply),
             }).catch(() => null);
 
             send("done", {

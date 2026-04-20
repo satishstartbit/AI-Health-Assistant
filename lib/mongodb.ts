@@ -41,6 +41,7 @@ export type SavedConversationInput = {
   assistantMessage: string;
   riskLevel: RiskLevel;
   sourcesUsed: string[];
+  messages?: ConversationMessage[];
 };
 
 export type RelevantConversationMatch = ConversationRecord & {
@@ -295,25 +296,34 @@ export async function getConversationMessages(userId: string, limit = 8) {
         ? record.createdAt.toISOString()
         : new Date(record.createdAt).toISOString();
 
-      return [
-        {
-          id: `${record._id?.toString() ?? generateSafeId()}-user`,
-          role: "user" as const,
-          content: getUserText(record),
-          createdAt,
-        },
-        {
-          id: `${record._id?.toString() ?? generateSafeId()}-assistant`,
-          role: "assistant" as const,
-          content: getAssistantText(record),
-          createdAt,
-          meta: {
-            riskLevel: record.riskLevel || record.risk_level || "Medium",
-            sourcesUsed: record.sourcesUsed ?? [],
-            fromCache: false,
-          },
-        },
-      ];
+      const storedMessages = Array.isArray(record.messages) && record.messages.length > 0
+        ? record.messages
+        : [
+            {
+              role: "user" as const,
+              content: getUserText(record),
+            },
+            {
+              role: "assistant" as const,
+              content: getAssistantText(record),
+            },
+          ];
+
+      return storedMessages.map((message, index) => ({
+        id: `${record._id?.toString() ?? generateSafeId()}-${message.role}-${index}`,
+        role: message.role,
+        content: message.content,
+        createdAt,
+        ...(message.role === "assistant"
+          ? {
+              meta: {
+                riskLevel: record.riskLevel || record.risk_level || "Medium",
+                sourcesUsed: record.sourcesUsed ?? [],
+                fromCache: false,
+              },
+            }
+          : {}),
+      }));
     });
 }
 
@@ -375,10 +385,13 @@ export async function saveConversation(
     assistantMessage: input.assistantMessage,
     riskLevel: input.riskLevel,
     sourcesUsed: input.sourcesUsed,
-    messages: [
-      { role: "user", content: input.userMessage },
-      { role: "assistant", content: input.assistantMessage },
-    ],
+    messages:
+      input.messages && input.messages.length > 0
+        ? input.messages
+        : [
+            { role: "user", content: input.userMessage },
+            { role: "assistant", content: input.assistantMessage },
+          ],
     embeddingText,
     embeddingPayload: embeddingVector,
     queryText,
