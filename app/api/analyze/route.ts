@@ -390,6 +390,7 @@ async function assessQuerySufficiency(
 A query IS sufficient if it includes:
 - A clear symptom or health concern
 - At least some context: duration, severity, body location, or other relevant details
+- General informational queries about symptoms, conditions, or treatments (e.g., "what are the symptoms of diabetes?" or "how to treat a cold?") — these are sufficient and do not require clarifying questions
 
 A query is NOT sufficient when it is too vague to act on, for example:
 - "I feel sick" — what symptoms exactly?
